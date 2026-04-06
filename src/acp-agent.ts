@@ -456,9 +456,12 @@ export class ClaudeAcpAgent implements Agent {
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     const sdk_sessions = await listSessions({ dir: params.cwd ?? undefined });
     const sessions = [];
+    const filterCwd = params.cwd;
 
     for (const session of sdk_sessions) {
       if (!session.cwd) continue;
+      // Filter sessions to current project only — don't mix projects
+      if (filterCwd && session.cwd !== filterCwd) continue;
       sessions.push({
         sessionId: session.sessionId,
         cwd: session.cwd,
