@@ -231,7 +231,11 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
-const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+const LOCAL_ONLY_COMMANDS = new Set([
+  "/context", "/heapdump", "/extra-usage",
+  "/compact", "/help", "/config", "/cost",
+  "/login", "/logout", "/status", "/memory",
+]);
 
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
@@ -519,14 +523,43 @@ export class ClaudeAcpAgent implements Agent {
     session.promptRunning = true;
     let handedOff = false;
     let stopReason: StopReason = "end_turn";
+    let gotResult = false;
+    let resultTimeout: ReturnType<typeof setTimeout> | null = null;
 
     try {
       while (true) {
-        const { value: message, done } = await session.query.next();
+        // If we got a result but idle never came, wait up to 5s then return
+        const nextPromise = session.query.next();
+        let timedOut = false;
+
+        const { value: message, done } = gotResult
+          ? await Promise.race([
+              nextPromise,
+              new Promise<{ value: undefined; done: true }>((resolve) => {
+                resultTimeout = setTimeout(() => {
+                  timedOut = true;
+                  resolve({ value: undefined, done: true });
+                }, 5000);
+              }),
+            ])
+          : await nextPromise;
+
+        if (resultTimeout) {
+          clearTimeout(resultTimeout);
+          resultTimeout = null;
+        }
+
+        if (timedOut) {
+          this.logger.log("Idle state not received after result, returning with timeout fallback");
+          return { stopReason, usage: sessionUsage(session) };
+        }
 
         if (done || !message) {
           if (session.cancelled) {
             return { stopReason: "cancelled" };
+          }
+          if (gotResult) {
+            return { stopReason, usage: sessionUsage(session) };
           }
           break;
         }
@@ -586,6 +619,11 @@ export class ClaudeAcpAgent implements Agent {
                     content: { type: "text", text: message.content },
                   },
                 });
+                // Local commands don't always emit idle state (#435).
+                // Mark gotResult so the timeout fallback kicks in quickly.
+                if (isLocalOnlyCommand) {
+                  gotResult = true;
+                }
                 break;
               }
               case "session_state_changed": {
@@ -598,13 +636,50 @@ export class ClaudeAcpAgent implements Agent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
-              case "task_progress":
               case "elicitation_complete":
               case "api_retry":
-                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                // Todo: process via status api
                 break;
+              case "task_started": {
+                // Forward background task start to client (#336)
+                const taskMsg = message as any;
+                await this.client.sessionUpdate({
+                  sessionId: taskMsg.session_id ?? params.sessionId,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: `\n🔄 Background task started: ${taskMsg.task_id ?? "unknown"}\n` },
+                  },
+                });
+                break;
+              }
+              case "task_notification": {
+                // Forward task notifications to client (#336)
+                const taskNotif = message as any;
+                if (taskNotif.message || taskNotif.content) {
+                  await this.client.sessionUpdate({
+                    sessionId: taskNotif.session_id ?? params.sessionId,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: taskNotif.message ?? taskNotif.content ?? "" },
+                    },
+                  });
+                }
+                break;
+              }
+              case "task_progress": {
+                // Forward task progress to client (#336)
+                const taskProg = message as any;
+                if (taskProg.content) {
+                  await this.client.sessionUpdate({
+                    sessionId: taskProg.session_id ?? params.sessionId,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: taskProg.content },
+                    },
+                  });
+                }
+                break;
+              }
               default:
                 unreachable(message, this.logger);
                 break;
@@ -624,20 +699,20 @@ export class ClaudeAcpAgent implements Agent {
             lastContextWindowSize = contextWindowSize;
 
             // Send usage_update notification
-            if (lastAssistantTotalUsage !== null) {
-              await this.client.sessionUpdate({
-                sessionId: params.sessionId,
-                update: {
-                  sessionUpdate: "usage_update",
-                  used: lastAssistantTotalUsage,
-                  size: contextWindowSize,
-                  cost: {
-                    amount: message.total_cost_usd,
-                    currency: "USD",
-                  },
+            // Guard against null/undefined used value (#375)
+            const usedTokens = lastAssistantTotalUsage ?? 0;
+            await this.client.sessionUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "usage_update",
+                used: usedTokens,
+                size: contextWindowSize,
+                cost: {
+                  amount: message.total_cost_usd ?? 0,
+                  currency: "USD",
                 },
-              });
-            }
+              },
+            });
 
             if (session.cancelled) {
               stopReason = "cancelled";
@@ -656,18 +731,21 @@ export class ClaudeAcpAgent implements Agent {
                 if (message.is_error) {
                   throw RequestError.internalError(undefined, message.result);
                 }
-                // For local-only commands (no model invocation), the result
-                // text is the command output — forward it to the client.
-                if (isLocalOnlyCommand) {
-                  for (const notification of toAcpNotifications(
-                    message.result,
-                    "assistant",
-                    params.sessionId,
-                    this.toolUseCache,
-                    this.client,
-                    this.logger,
-                  )) {
-                    await this.client.sessionUpdate(notification);
+                // Forward result text when no stream events were emitted
+                // (fixes #453: output_tokens=0 means no stream_event chunks,
+                // so the result text is the only content to show)
+                if (isLocalOnlyCommand || message.usage.output_tokens === 0) {
+                  if (message.result) {
+                    for (const notification of toAcpNotifications(
+                      message.result,
+                      "assistant",
+                      params.sessionId,
+                      this.toolUseCache,
+                      this.client,
+                      this.logger,
+                    )) {
+                      await this.client.sessionUpdate(notification);
+                    }
                   }
                 }
                 break;
@@ -701,6 +779,8 @@ export class ClaudeAcpAgent implements Agent {
                 unreachable(message, this.logger);
                 break;
             }
+            // Mark that we got a result — start idle timeout fallback
+            gotResult = true;
             break;
           }
           case "stream_event": {
@@ -846,7 +926,10 @@ export class ClaudeAcpAgent implements Agent {
             break;
         }
       }
-      throw new Error("Session did not end in result");
+      // If loop ended without result (query iterator exhausted),
+      // return gracefully instead of crashing (#497)
+      this.logger.log("Session query iterator ended without explicit result");
+      return { stopReason, usage: sessionUsage(session) };
     } catch (error) {
       if (error instanceof RequestError || !(error instanceof Error)) {
         throw error;
@@ -1151,27 +1234,45 @@ export class ClaudeAcpAgent implements Agent {
         };
       }
 
-      const response = await this.client.requestPermission({
-        options: [
-          {
-            kind: "allow_always",
-            name: "Always Allow",
-            optionId: "allow_always",
-          },
-          { kind: "allow_once", name: "Allow", optionId: "allow" },
-          { kind: "reject_once", name: "Reject", optionId: "reject" },
-        ],
-        sessionId,
-        toolCall: {
-          toolCallId: toolUseID,
-          rawInput: toolInput,
-          ...toolInfoFromToolUse(
-            { name: toolName, input: toolInput, id: toolUseID },
-            supportsTerminalOutput,
-            session?.cwd,
+      // Request permission with timeout fallback (#329)
+      // Subagent tool calls may not surface permission prompts in UI,
+      // causing silent hangs. Timeout after 60s and deny.
+      const PERMISSION_TIMEOUT = 60_000;
+      let response: Awaited<ReturnType<typeof this.client.requestPermission>>;
+      try {
+        response = await Promise.race([
+          this.client.requestPermission({
+            options: [
+              {
+                kind: "allow_always",
+                name: "Always Allow",
+                optionId: "allow_always",
+              },
+              { kind: "allow_once", name: "Allow", optionId: "allow" },
+              { kind: "reject_once", name: "Reject", optionId: "reject" },
+            ],
+            sessionId,
+            toolCall: {
+              toolCallId: toolUseID,
+              rawInput: toolInput,
+              ...toolInfoFromToolUse(
+                { name: toolName, input: toolInput, id: toolUseID },
+                supportsTerminalOutput,
+                session?.cwd,
+              ),
+            },
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Permission request timed out")), PERMISSION_TIMEOUT)
           ),
-        },
-      });
+        ]);
+      } catch (e) {
+        this.logger.error(`Permission request for ${toolName} timed out or failed: ${e}`);
+        return {
+          behavior: "deny" as const,
+          message: `Permission request timed out for ${toolName}. Check if the permission prompt was shown in the UI.`,
+        };
+      }
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
         throw new Error("Tool use aborted");
       }
@@ -1205,6 +1306,47 @@ export class ClaudeAcpAgent implements Agent {
         };
       }
     };
+  }
+
+  /**
+   * Discover installed Claude Code plugins (#461).
+   * Scans ~/.claude/plugins/ for directories containing .claude-plugin/plugin.json
+   */
+  private discoverPlugins(): string[] {
+    const pluginDirs: string[] = [];
+    try {
+      const baseDir = path.join(CLAUDE_CONFIG_DIR, "plugins");
+      if (!fs.existsSync(baseDir)) return pluginDirs;
+
+      // Scan direct children and marketplace subdirs
+      const scanDir = (dir: string) => {
+        for (const entry of fs.readdirSync(dir)) {
+          const full = path.join(dir, entry);
+          if (!fs.statSync(full).isDirectory()) continue;
+          // Check if this directory is a plugin (has .claude-plugin/plugin.json)
+          const manifest = path.join(full, ".claude-plugin", "plugin.json");
+          if (fs.existsSync(manifest)) {
+            pluginDirs.push(full);
+          }
+          // Check one level deeper (for marketplaces/org/plugin structure)
+          if (entry === "marketplaces" || entry === "cache") {
+            for (const subEntry of fs.readdirSync(full)) {
+              const subFull = path.join(full, subEntry);
+              if (fs.statSync(subFull).isDirectory()) {
+                scanDir(subFull);
+              }
+            }
+          }
+        }
+      };
+      scanDir(baseDir);
+      if (pluginDirs.length > 0) {
+        this.logger.log(`Discovered ${pluginDirs.length} plugins: ${pluginDirs.map(p => path.basename(p)).join(", ")}`);
+      }
+    } catch (e) {
+      this.logger.error(`Plugin discovery failed: ${e}`);
+    }
+    return pluginDirs;
   }
 
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
@@ -1374,18 +1516,30 @@ export class ClaudeAcpAgent implements Agent {
 
     const abortController = userProvidedOptions?.abortController || new AbortController();
 
+    // Load installed plugins (#461) — scan ~/.claude/plugins/
+    const pluginPaths = this.discoverPlugins();
+
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
+      ...(pluginPaths.length > 0 && {
+        plugins: pluginPaths.map((p) => ({ type: "local" as const, path: p })),
+      }),
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
-      env: {
-        ...process.env,
-        ...userProvidedOptions?.env,
-        ...createEnvForGateway(this.gatewayAuthMeta),
-        // Opt-in to session state events like when the agent is idle
-        CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
-      },
+      // Only set env if we have custom vars beyond the defaults (#404)
+      // Setting env explicitly can break Bash tool's default env inheritance
+      env: Object.keys(userProvidedOptions?.env ?? {}).length > 0 || this.gatewayAuthMeta
+        ? {
+            ...process.env,
+            ...userProvidedOptions?.env,
+            ...createEnvForGateway(this.gatewayAuthMeta),
+            CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+          }
+        : {
+            ...process.env,
+            CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+          },
       // Override certain fields that must be controlled by ACP
       cwd: params.cwd,
       includePartialMessages: true,
