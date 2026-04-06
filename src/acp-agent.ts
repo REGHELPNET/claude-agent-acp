@@ -431,10 +431,12 @@ export class ClaudeAcpAgent implements Agent {
   async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     const result = await this.getOrCreateSession(params);
 
-    // Needs to happen after we return the session
+    // Delay commands update to ensure SDK is fully initialized (#391).
+    // setTimeout(fn, 0) can race with SDK init; 500ms gives it time
+    // to load skills, commands, and plugins for the resumed session.
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
-    }, 0);
+    }, 500);
     return result;
   }
 
@@ -955,16 +957,16 @@ export class ClaudeAcpAgent implements Agent {
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
-        // This usually should not happen, but in case the loop finishes
-        // without claude sending all message replays, we resolve the
-        // next pending prompt call to ensure no prompts get stuck.
+        // Resolve ALL pending prompt calls to ensure none get stuck (#283).
+        // Previously only the first pending was resolved, leaving others
+        // hanging forever if Claude didn't replay their messages.
         if (session.pendingMessages.size > 0) {
-          const next = [...session.pendingMessages.entries()].sort(
+          const sorted = [...session.pendingMessages.entries()].sort(
             (a, b) => a[1].order - b[1].order,
-          )[0];
-          if (next) {
-            next[1].resolve(false);
-            session.pendingMessages.delete(next[0]);
+          );
+          for (const [uuid, pending] of sorted) {
+            pending.resolve(false);
+            session.pendingMessages.delete(uuid);
           }
         }
       }
@@ -1094,9 +1096,10 @@ export class ClaudeAcpAgent implements Agent {
       case "bypassPermissions":
       case "dontAsk":
       case "plan":
+      case "auto":
         break;
       default:
-        throw new Error("Invalid Mode");
+        throw new Error(`Invalid Mode: ${modeId}`);
     }
     try {
       await this.sessions[sessionId].query.setPermissionMode(modeId);
